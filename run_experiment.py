@@ -3,22 +3,34 @@ import matplotlib.pyplot as plt
 
 def main():
     print("Step 1: Rebuilding Docker image...")
+    dockerfile_content = """FROM python:3.10-slim
+RUN apt-get update && apt-get install -y build-essential python3-dev
+RUN pip install hnswlib numpy
+COPY worker.py /app/worker.py
+WORKDIR /app
+CMD ["python", "worker.py"]
+"""
+    with open("Dockerfile", "w") as f:
+        f.write(dockerfile_content)
+
     subprocess.run(["docker", "build", "-t", "hnsw-stress-test", "."], check=True)
     
+    # The payload is ~850 MB minimum. 
+    # Giving 3000 MB Total guarantees it survives the middle phases so you see the latency spike.
     configs = [
-        (250, 250),
-        (180, 300),
-        (120, 300),
-        (80,  300),
-        (80,  80),
+        (1500, 3000), # Phase 1: 1.5 GB RAM -> Plenty of room (FAST)
+        (950,  3000), # Phase 1: 950 MB RAM -> Snug, but fits entirely in RAM (FAST)
+        (650,  3000), # Phase 2: 650 MB RAM -> 200 MB too small! OS must use SSD Swap (HIGH LATENCY)
+        (400,  3000), # Phase 2: 400 MB RAM -> Extreme SSD thrashing (MASSIVE LATENCY)
+        (400,  400),  # Phase 3: 400 MB Total -> Out of RAM & Out of Swap -> CRASH
     ]
     
     plot_limits, plot_latencies, plot_recalls = [], [], []
     crash_point = None
 
-    print("\n--- Starting True Memory Stress Test ---")
-    print(f"{'RAM Limit':<10} | {'Total Limit':<12} | {'Memory':<18} | {'Latency (ms)'}")
-    print("-" * 60)
+    print("\n--- Starting 1-MILLION QUERY Stress Test (Single-Threaded to Expose SSD) ---")
+    print(f"{'RAM Limit':<10} | {'Total Limit':<12} | {'Memory Status':<18} | {'Avg Latency (ms)'}")
+    print("-" * 65)
 
     for ram, total_mem in configs:
         cmd = [
@@ -32,7 +44,6 @@ def main():
             result = subprocess.run(cmd, capture_output=True, text=True)
 
             if result.returncode == 137:
-                # Real OOM: kernel killed the process for exceeding memory
                 print(f"{ram} MB     | {total_mem} MB      | Crashed (OOM)       | -")
                 plot_limits.append(ram)
                 plot_latencies.append(0)
@@ -48,15 +59,18 @@ def main():
                 recall = float(parts[1])
                 latency = float(parts[2])
                 vm_swap_kb = int(parts[4]) if len(parts) >= 5 else 0
-                # Memory status from kernel VmSwap (real data)
-                memory_status = "RAM only" if vm_swap_kb == 0 else "Swapping"
-                print(f"{ram} MB     | {total_mem} MB      | {memory_status:<18} | {latency:.2f} ms")
+                
+                # Real data reported directly by the kernel
+                memory_status = "RAM only" if vm_swap_kb == 0 else f"Swapping ({vm_swap_kb/1024:.1f} MB)"
+                print(f"{ram} MB     | {total_mem} MB      | {memory_status:<18} | {latency:.4f} ms")
                 
                 plot_limits.append(ram)
                 plot_recalls.append(float(recall))
                 plot_latencies.append(latency)
             else:
                 print(f"{ram} MB     | {total_mem} MB      | ❌ FAILED UNEXPECTEDLY")
+                print("\n--- EXACT ERROR LOG ---")
+                print(result.stderr if result.stderr else result.stdout)
                 break
 
         except Exception as e:
@@ -72,7 +86,7 @@ def main():
     ax1.set_ylim(-0.05, 1.05)
     
     ax2 = ax1.twinx()
-    ax2.set_ylabel("Query Latency (ms)", color="tab:orange", fontweight='bold')
+    ax2.set_ylabel("Avg Query Latency (ms)", color="tab:orange", fontweight='bold')
     ax2.plot(plot_limits, plot_latencies, "s-", color="tab:orange", linewidth=2.5, label="Latency (ms)")
     
     if crash_point is not None:
@@ -85,7 +99,7 @@ def main():
             fontweight="bold", va="center"
         )
 
-    fig.suptitle("HNSW Performance vs Memory Limit (Real Docker Constraints)", fontsize=14, fontweight='bold')
+    fig.suptitle("1 Million Queries: True Hardware Swapping & Latency", fontsize=14, fontweight='bold')
     fig.tight_layout()
     fig.savefig("true_memory_crash_plot.png", dpi=300)
     print(f"\n✅ Graph successfully saved as: true_memory_crash_plot.png")

@@ -3,37 +3,55 @@ import numpy as np
 import hnswlib
 
 def main():
-    # 150,000 vectors = exactly ~76 MB of raw data, plus ~20 MB for the HNSW graph.
-    # Total memory footprint inside the cage will naturally sit around 130 MB.
-    num_elements, dim, k = 150000, 128, 10
-    num_queries = 200  # Fewer queries for speed; logic unchanged
+    # Dataset: 300k vectors (~150 MB dataset + ~60 MB Graph)
+    num_elements, dim, k = 300000, 128, 10
+    
+    # 1,000,000 queries. (This single array is 512 MB of physical RAM).
+    num_queries_total = 1000000  
+    
+    # We only brute-force the exact answer key for the first 1,000 so the script doesn't take days
+    num_queries_eval = 1000 
 
-    np.random.seed(42)
-    train_data = np.random.randn(num_elements, dim).astype(np.float32)
-    queries = np.random.randn(num_queries, dim).astype(np.float32)
+    rng = np.random.default_rng(42)
+    print("Generating train_data...")
+    train_data = rng.standard_normal((num_elements, dim), dtype=np.float32)
+    print("Generating queries...")
+    queries = rng.standard_normal((num_queries_total, dim), dtype=np.float32)
 
-    # Memory-efficient exact NN: one query at a time to minimize peak RAM
-    exact = np.zeros((num_queries, k), dtype=np.int32)
-    for i in range(num_queries):
-        dists = np.sum((train_data - queries[i])**2, axis=1)
+    # 1. Exact Answer Key (Only first 1,000)
+    print("Computing exact answer key...")
+    exact = np.zeros((num_queries_eval, k), dtype=np.int32)
+    diffs = np.empty_like(train_data)
+    for i in range(num_queries_eval):
+        np.subtract(train_data, queries[i], out=diffs)
+        np.square(diffs, out=diffs)
+        dists = np.sum(diffs, axis=1)
         exact[i] = np.argsort(dists)[:k]
     
-    # Build HNSW graph
+    del diffs
+    import gc; gc.collect()
+    
+    # 2. Build HNSW graph
+    print("Building HNSW graph...")
     index = hnswlib.Index(space='l2', dim=dim)
     index.init_index(max_elements=num_elements, ef_construction=200, M=32)
     index.add_items(train_data, np.arange(num_elements))
     index.set_ef(50)
     
-    # Search and measure time
+    # 3. MASSIVE SEARCH: 1 Million queries!
+    print("Starting massive search...")
     t0 = time.perf_counter()
-    approx, _ = index.knn_query(queries, k=k)
-    latency_ms = (time.perf_counter() - t0) * 1000  # seconds -> ms
+    approx, distances = index.knn_query(queries, k=k, num_threads=1)
+    
+    latency_ms = ((time.perf_counter() - t0) / num_queries_total) * 1000
 
-    # Output results
-    hits = sum(len(set(a).intersection(set(t))) for a, t in zip(approx, exact))
-    recall = hits / (num_queries * k)
+    # 4. Accuracy Grade (Only grade the first 1,000)
+    print("Grading accuracy...")
+    approx_eval = approx[:num_queries_eval]
+    hits = sum(len(set(a).intersection(set(t))) for a, t in zip(approx_eval, exact))
+    recall = hits / (num_queries_eval * k)
 
-    # Real kernel memory stats from /proc (no inference)
+    # 5. Kernel RAM Stats (Real, undeniable OS hardware data)
     vm_rss_kb = 0
     vm_swap_kb = 0
     try:
