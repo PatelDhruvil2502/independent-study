@@ -29,8 +29,8 @@ CMD ["python", "worker.py"]
     crash_point = None
 
     print("\n--- Starting 1-MILLION QUERY Stress Test (Single-Threaded to Expose SSD) ---")
-    print(f"{'RAM Limit':<10} | {'Total Limit':<12} | {'Memory Status':<18} | {'Avg Latency (ms)'}")
-    print("-" * 65)
+    print(f"{'RAM Limit':<10} | {'Total Limit':<12} | {'Memory Status':<18} | {'Avg Latency (ms)':<16} | {'Queries @ Addr'}")
+    print("-" * 80)
 
     for ram, total_mem in configs:
         cmd = [
@@ -52,6 +52,7 @@ CMD ["python", "worker.py"]
                 break
 
             output = result.stdout.strip().splitlines()
+            mem_line = [line for line in output if line.startswith("MEMORY_LAYOUT")]
             res_line = [line for line in output if line.startswith("RESULT")]
 
             if res_line:
@@ -60,9 +61,11 @@ CMD ["python", "worker.py"]
                 latency = float(parts[2])
                 vm_swap_kb = int(parts[4]) if len(parts) >= 5 else 0
                 
+                q_start = mem_line[0].split(",")[1] if mem_line else "-"
+                
                 # Real data reported directly by the kernel
                 memory_status = "RAM only" if vm_swap_kb == 0 else f"Swapping ({vm_swap_kb/1024:.1f} MB)"
-                print(f"{ram} MB     | {total_mem} MB      | {memory_status:<18} | {latency:.4f} ms")
+                print(f"{ram} MB     | {total_mem} MB      | {memory_status:<18} | {latency:<16.4f} | {q_start}")
                 
                 plot_limits.append(ram)
                 plot_recalls.append(float(recall))

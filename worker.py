@@ -65,6 +65,13 @@ def main():
     except Exception:
         pass
 
+    # Extract REAL hexadecimal memory addresses as they exist inside the Linux Docker container!
+    q_start = hex(queries.__array_interface__['data'][0])
+    q_size_mb = queries.nbytes / (1024 * 1024)
+    t_start = hex(train_data.__array_interface__['data'][0])
+    t_size_mb = train_data.nbytes / (1024 * 1024)
+    
+    print(f"MEMORY_LAYOUT,{q_start},{q_size_mb:.1f},{t_start},{t_size_mb:.1f}")
     print(f"RESULT,{recall},{latency_ms},{vm_rss_kb},{vm_swap_kb}")
 
 if __name__ == "__main__":
