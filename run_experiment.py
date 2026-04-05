@@ -2,7 +2,6 @@ import subprocess
 import matplotlib.pyplot as plt
 import argparse
 import csv
-import os
 
 def run_one(ram_mb, swap_mb, image_name, env_vars=None):
     import uuid
@@ -57,30 +56,11 @@ def parse_output(output_lines):
             data["dim"] = int(parts[2])
     return data
 
-def build_image(image_name, disable_prefetch=False):
+def build_image(image_name):
     print(f"Building Docker image ({image_name})...")
     dockerfile_content = """FROM python:3.10-slim
-RUN apt-get update && apt-get install -y build-essential python3-dev git
-ARG DISABLE_PREFETCH=0
-RUN pip install numpy
-RUN git clone --depth 1 https://github.com/nmslib/hnswlib.git /tmp/hnswlib
-RUN if [ "$DISABLE_PREFETCH" = "1" ]; then \
-      python3 -c "\
-from pathlib import Path; \
-p = Path('/tmp/hnswlib/hnswlib/hnswalg.h'); \
-t = p.read_text(); \
-marker = '#include <memory>'; \
-inject = chr(10) + '#ifdef DISABLE_HNSW_PREFETCH' + chr(10) + '#define _mm_prefetch(a, sel) ((void)0)' + chr(10) + '#endif' + chr(10); \
-assert marker in t, 'Marker not found in hnswalg.h'; \
-t = t.replace(marker, marker + inject, 1); \
-assert 'DISABLE_HNSW_PREFETCH' in t, 'Patch injection failed'; \
-p.write_text(t)"; \
-    fi
-RUN if [ "$DISABLE_PREFETCH" = "1" ]; then \
-      CXXFLAGS='-DDISABLE_HNSW_PREFETCH' pip install /tmp/hnswlib; \
-    else \
-      pip install /tmp/hnswlib; \
-    fi && rm -rf /tmp/hnswlib
+RUN apt-get update && apt-get install -y build-essential python3-dev
+RUN pip install hnswlib numpy
 COPY worker.py /app/worker.py
 COPY real_world_dataset.npy /app/real_world_dataset.npy
 WORKDIR /app
@@ -90,11 +70,9 @@ CMD ["python", "worker.py"]
         f.write(dockerfile_content)
 
     build_cmd = ["docker", "build", "--platform", "linux/amd64", "-t", image_name, "."]
-    if disable_prefetch:
-        build_cmd.extend(["--build-arg", "DISABLE_PREFETCH=1"])
     subprocess.run(build_cmd, check=True)
 
-def run_experiment(image_name, label, args):
+def run_experiment(image_name, args):
     env_vars = {
         "HNSW_K": str(args.k),
         "HNSW_EF": str(args.ef),
@@ -110,14 +88,14 @@ def run_experiment(image_name, label, args):
     crash_point = None
 
     # Probe: one run with high limit to get real memory use
-    print(f"\nProbe run [{label}] (discover real memory use from container /proc)...")
+    print("\nProbe run (discover real memory use from container /proc)...")
     probe_ram, probe_swap = 4096, 8192
     result = run_one(probe_ram, probe_swap, image_name, env_vars)
     output = result.stdout.strip().splitlines()
     data = parse_output(output)
 
     if "latency_ms" not in data or result.returncode != 0:
-        print(f"Probe failed for [{label}]; cannot derive limits from real data.")
+        print("Probe failed; cannot derive limits from real data.")
         if output:
             print(result.stderr or "\n".join(output[-20:]))
         return None
@@ -141,7 +119,7 @@ def run_experiment(image_name, label, args):
         f"{'Latency (ms)':<14} | {'p50':<8} | {'p95':<8} | {'p99':<8} | "
         f"{'Recall':<8} | {'Page Faults':<12}"
     )
-    print(f"\n--- Running 5-stage validation [{label}] ---")
+    print(f"\n--- Running 5-stage memory stress test ---")
     print(header)
     print("-" * len(header))
 
@@ -193,7 +171,7 @@ def run_experiment(image_name, label, args):
         })
 
     # --- Save CSV ---
-    csv_path = f"results_{label}.csv"
+    csv_path = "results.csv"
     if all_stage_data:
         keys = all_stage_data[0].keys()
         with open(csv_path, "w", newline="") as f:
@@ -238,70 +216,20 @@ def run_experiment(image_name, label, args):
         )
 
     fig.suptitle(
-        f"HNSW Memory Stress: Latency & Page Faults vs RAM [{label}]\n"
+        f"HNSW Memory Stress: Latency & Page Faults vs RAM\n"
         f"(ef={args.ef}, M={args.hnsw_m}, k={args.k})",
         fontsize=13, fontweight='bold'
     )
     fig.tight_layout()
-    output_plot = f"memory_stress_{label}.png"
-    fig.savefig(output_plot, dpi=300)
-    print(f"\nPlot saved: {output_plot}")
-    plt.close(fig)
-
-    return {
-        "label": label,
-        "ram_limits": plot_limits,
-        "latencies": plot_latencies,
-        "page_faults": plot_page_faults,
-        "stages": all_stage_data,
-    }
-
-def run_comparison_plot(prefetch_on, prefetch_off, args):
-    if not prefetch_on or not prefetch_off:
-        return
-    if not prefetch_on["ram_limits"] or not prefetch_off["ram_limits"]:
-        return
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-
-    # Panel 1: Latency comparison
-    ax1.invert_xaxis()
-    ax1.set_xlabel("Physical RAM Allowed (MB) — Decreasing ->", fontweight='bold')
-    ax1.set_ylabel("Avg Query Latency (ms)", fontweight='bold')
-    ax1.plot(prefetch_on["ram_limits"], prefetch_on["latencies"], "o-", linewidth=2.2, label="Prefetch ON")
-    ax1.plot(prefetch_off["ram_limits"], prefetch_off["latencies"], "s-", linewidth=2.2, label="Prefetch OFF")
-    ax1.grid(True, alpha=0.3)
-    ax1.legend()
-    ax1.set_title("Latency vs RAM")
-
-    # Panel 2: Page faults comparison
-    ax2.invert_xaxis()
-    ax2.set_xlabel("Physical RAM Allowed (MB) — Decreasing ->", fontweight='bold')
-    ax2.set_ylabel("Major Page Faults", fontweight='bold')
-    ax2.plot(prefetch_on["ram_limits"], prefetch_on["page_faults"], "o-", linewidth=2.2, label="Prefetch ON")
-    ax2.plot(prefetch_off["ram_limits"], prefetch_off["page_faults"], "s-", linewidth=2.2, label="Prefetch OFF")
-    ax2.grid(True, alpha=0.3)
-    ax2.legend()
-    ax2.set_title("Page Faults vs RAM")
-
-    fig.suptitle(
-        f"HNSW Prefetch ON vs OFF Under Memory Pressure\n"
-        f"(ef={args.ef}, M={args.hnsw_m}, k={args.k})",
-        fontsize=13, fontweight='bold'
-    )
-    fig.tight_layout()
-    fig.savefig("prefetch_comparison_plot.png", dpi=300)
-    print("\nComparison plot saved: prefetch_comparison_plot.png")
+    fig.savefig("memory_stress_plot.png", dpi=300)
+    print(f"\nPlot saved: memory_stress_plot.png")
     plt.close(fig)
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run HNSW memory stress experiment with optional prefetch control."
+        description="Run HNSW memory stress experiment — measures latency, tail percentiles, "
+                    "recall, and page faults as RAM is progressively reduced."
     )
-    parser.add_argument("--disable-prefetch", action="store_true",
-                        help="Build hnswlib with prefetch disabled.")
-    parser.add_argument("--compare", action="store_true",
-                        help="Run both prefetch ON and OFF and save comparison plot.")
     parser.add_argument("--ef", type=int, default=100, help="HNSW ef search parameter (default: 100)")
     parser.add_argument("--k", type=int, default=20, help="Number of nearest neighbors (default: 20)")
     parser.add_argument("--hnsw-m", type=int, default=16, help="HNSW M parameter (default: 16)")
@@ -311,19 +239,9 @@ def main():
     parser.add_argument("--recall-samples", type=int, default=200, help="Queries for recall measurement (default: 200)")
     args = parser.parse_args()
 
-    if args.compare:
-        on_image = "hnsw-stress-test-prefetch-on"
-        off_image = "hnsw-stress-test-prefetch-off"
-        build_image(on_image, disable_prefetch=False)
-        baseline = run_experiment(on_image, "prefetch_on", args)
-        build_image(off_image, disable_prefetch=True)
-        no_prefetch = run_experiment(off_image, "prefetch_off", args)
-        run_comparison_plot(baseline, no_prefetch, args)
-    else:
-        image_name = "hnsw-stress-test-no-prefetch" if args.disable_prefetch else "hnsw-stress-test"
-        label = "prefetch_off" if args.disable_prefetch else "prefetch_on"
-        build_image(image_name, disable_prefetch=args.disable_prefetch)
-        run_experiment(image_name, label, args)
+    image_name = "hnsw-memory-stress"
+    build_image(image_name)
+    run_experiment(image_name, args)
 
 if __name__ == "__main__":
     main()
